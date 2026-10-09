@@ -4,16 +4,73 @@ from tkinter import ttk, messagebox
 import re
 import socket
 import subprocess
+import asyncio
+import threading
+
+try:
+    from bleak import BleakClient
+except ImportError:
+    BleakClient = None
 
 # Canal RFCOMM padrão do HC-05 (SPP)
 RFCOMM_CHANNEL = 1
 
-# Lista dispositivos Bluetooth pareados no Windows
+# Característica BLE padrão de módulos serial (HM-10 / HC-08 / HC-05 BLE)
+BLE_PREFERRED_CHAR = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+# Lista dispositivos Bluetooth pareados no Windows (clássicos e BLE)
 PS_LIST_DEVICES = (
     "Get-PnpDevice -Class Bluetooth | "
-    "Where-Object { $_.InstanceId -like 'BTHENUM\\DEV_*' } | "
+    "Where-Object { $_.InstanceId -like 'BTHENUM\\DEV_*' -or $_.InstanceId -like 'BTHLE\\DEV_*' } | "
     "ForEach-Object { $_.FriendlyName + '|' + $_.InstanceId }"
 )
+
+
+class BleConnection:
+    """Conexão BLE com interface parecida com socket (sendall/close)."""
+
+    def __init__(self, address):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.client = BleakClient(address)
+        self.char = None
+        try:
+            self._run(self._connect(), 20)
+        except Exception:
+            self.close()
+            raise
+
+    def _run(self, coro, timeout):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    async def _connect(self):
+        await self.client.connect()
+        chars = [c for s in self.client.services for c in s.characteristics]
+        writable = [
+            c for c in chars
+            if "write" in c.properties or "write-without-response" in c.properties
+        ]
+        if not writable:
+            raise RuntimeError("Nenhuma característica de escrita encontrada.")
+        self.char = next(
+            (c for c in writable if c.uuid.lower() == BLE_PREFERRED_CHAR),
+            writable[0]
+        )
+
+    async def _write(self, data):
+        response = "write-without-response" not in self.char.properties
+        await self.client.write_gatt_char(self.char, data, response=response)
+
+    def sendall(self, data):
+        self._run(self._write(data), 5)
+
+    def close(self):
+        try:
+            self._run(self.client.disconnect(), 5)
+        except Exception:
+            pass
+        self.loop.call_soon_threadsafe(self.loop.stop)
 
 
 class BluetoothController:
@@ -318,6 +375,7 @@ class BluetoothController:
     def refresh_ports(self):
 
         devices = {}
+        self.device_types = {}
 
         try:
             result = subprocess.run(
@@ -336,6 +394,9 @@ class BluetoothController:
                     mac = match.group(1).upper()
                     mac = ":".join(mac[i:i + 2] for i in range(0, 12, 2))
                     devices[mac] = name.strip()
+                    self.device_types[mac] = (
+                        "ble" if instance_id.startswith("BTHLE") else "classic"
+                    )
 
         except Exception as e:
             print(f"Erro ao listar dispositivos: {e}")
@@ -376,14 +437,21 @@ class BluetoothController:
 
         try:
 
-            connection = socket.socket(
-                socket.AF_BLUETOOTH,
-                socket.SOCK_STREAM,
-                socket.BTPROTO_RFCOMM
-            )
-            connection.settimeout(10)
-            connection.connect((address, RFCOMM_CHANNEL))
-            connection.settimeout(1)
+            if self.device_types.get(address) == "ble":
+                if BleakClient is None:
+                    raise RuntimeError(
+                        "Dispositivo BLE: instale a biblioteca com 'pip install bleak'."
+                    )
+                connection = BleConnection(address)
+            else:
+                connection = socket.socket(
+                    socket.AF_BLUETOOTH,
+                    socket.SOCK_STREAM,
+                    socket.BTPROTO_RFCOMM
+                )
+                connection.settimeout(10)
+                connection.connect((address, RFCOMM_CHANNEL))
+                connection.settimeout(1)
 
             self.serial_connection = connection
 
